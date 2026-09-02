@@ -1,32 +1,36 @@
-# Configurare Travos Monitor
+import os
 
-# Data centrala (format ZZ/LL/AAAA)
-BASE_DATE = "17/09/2026"
+# ==============================================================================
+# CONFIGURARE TRAVOS MONITOR
+# ==============================================================================
 
-# Interval fata de data centrala
-DAYS_BEFORE = 7
-DAYS_AFTER = 7
+# Data centrala de plecare (format ZZ/LL/AAAA)
+# Poate fi modificata direct aici sau prin variabila de mediu BASE_DATE
+BASE_DATE = os.getenv("BASE_DATE", "20/09/2026")
 
-# Cautarea
+# Interval fata de data centrala (numar de zile inainte / dupa)
+DAYS_BEFORE = int(os.getenv("DAYS_BEFORE", "2"))
+DAYS_AFTER = int(os.getenv("DAYS_AFTER", "2"))
+
+# Pret maxim (in EUR). Daca este None sau 0, nu filtreaza dupa pret maxim.
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0")) if os.getenv("MAX_PRICE") else None
+
+# Parametri de cautare
 SEARCH_PARAMS = {
     "country": "125",
     "region": "193",
-    "days": "7",
-    "dest_country": "125",
-    "dep_country": "113",
-    "dep_city": "193",      # Iasi
+    "days": "7",            # Durata sejur (7 nopti)
+    "dest_country": "125",  # Turcia
+    "dep_country": "113",   # Romania
+    "dep_city": "193",      # Iasi (sau 206 pentru Bucuresti)
     "dest_region": "124",   # Antalya
     "a_1": "2",             # 2 adulti
-    "mmax": "1400",
-    "meal[5]": "5",         # All Inclusive
-    "meal[6]": "6",         # Ultra All Inclusive
 }
 
 MAX_PAGES = 8
-REQUEST_DELAY_SECONDS = 2
+REQUEST_DELAY_SECONDS = 0.5
 
 DATABASE_FILE = "prices.db"
 EXCLUDED_HOTELS_FILE = "excluded_hotels.txt"
 
-# Momentan False. Vom activa dupa ce testam ca Travos este extras corect.
 USE_PLAYWRIGHT = False

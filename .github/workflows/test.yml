@@ -8,6 +8,23 @@ on:
   schedule:
     - cron: '0 8 * * *'
   workflow_dispatch:
+    inputs:
+      base_date:
+        description: 'Data de plecare (format ZZ/LL/AAAA)'
+        required: false
+        default: '20/09/2026'
+      days_before:
+        description: 'Zile inainte de data de plecare'
+        required: false
+        default: '1'
+      days_after:
+        description: 'Zile dupa data de plecare'
+        required: false
+        default: '1'
+      max_price:
+        description: 'Pret maxim in EUR (lasati 0 sau gol pentru nelimitat)'
+        required: false
+        default: '0'
 
 jobs:
   monitor:
@@ -30,6 +47,11 @@ jobs:
       run: pytest tests/ -v
     
     - name: Run monitor
+      env:
+        BASE_DATE: ${{ github.event.inputs.base_date || '20/09/2026' }}
+        DAYS_BEFORE: ${{ github.event.inputs.days_before || '1' }}
+        DAYS_AFTER: ${{ github.event.inputs.days_after || '1' }}
+        MAX_PRICE: ${{ github.event.inputs.max_price || '0' }}
       run: python main.py
 
     - name: Upload Database Artifact
