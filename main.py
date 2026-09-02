@@ -1,5 +1,6 @@
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import os
 import re
@@ -15,7 +16,7 @@ from config import (
     BASE_DATE, DAYS_BEFORE, DAYS_AFTER,
     REQUEST_DELAY_SECONDS, DATABASE_FILE,
     EXCLUDED_HOTELS_FILE, SEARCH_PARAMS,
-    MAX_PRICE
+    MAX_PRICE, MAX_WORKERS
 )
 
 BASE_URL = "https://www.travos.ro/search.php"
@@ -33,16 +34,10 @@ HEADERS = {
 }
 
 PRICE_RE = re.compile(r"(\d[\d.,]*)\s*€")
-RATING_RE = re.compile(r"(\d+)\s*stele|Nota\s*([\d.,]+)", re.I)
-MEALS = [
-    "Ultra All Inclusive",
-    "Ultra all inclusive",
-    "All Inclusive",
-    "All inclusive",
-    "Demipensiune",
-    "Pensiune Completa",
-    "Mic Dejun"
-]
+RATING_RE = re.compile(r"(\d+)\s*stele|filter-rating-(\d+)|Nota\s*([\d.,]+)", re.I)
+
+# Doar All Inclusive si Ultra All Inclusive
+ALLOWED_MEALS = ["Ultra All Inclusive", "All Inclusive"]
 
 
 def normalize_name(name):
@@ -164,50 +159,30 @@ def get_hotel_catalog(session, search_terms=None):
     return hotels
 
 
-def parse_ajax_offer(html_content, hotel_info, departure_date_str):
-    """Parse offer details from Travos AJAX response HTML"""
-    soup = BeautifulSoup(html_content, "html.parser")
-    
-    meal = ""
-    for m in MEALS:
-        if m.lower() in html_content.lower():
-            meal = m
-            break
-    
-    rating = ""
-    rating_match = RATING_RE.search(html_content)
-    if rating_match:
-        rating = rating_match.group(1) or rating_match.group(2)
-        if "stele" not in rating.lower() and rating_match.group(1):
-            rating = f"{rating} stele"
-    
-    link = ""
-    onclick = soup.find(attrs={"onclick": re.compile(r"window\.open\('([^']+)'")})
-    if onclick:
-        m = re.search(r"window\.open\('([^']+)'", onclick["onclick"])
-        if m:
-            link = m.group(1)
-    
-    if not link:
-        days = SEARCH_PARAMS.get("days", "7")
-        dep_city = SEARCH_PARAMS.get("dep_city", "193")
-        dest_region = SEARCH_PARAMS.get("dest_region", "124")
-        dep_country = SEARCH_PARAMS.get("dep_country", "113")
-        link = f"https://www.travos.ro/detail.php?from={departure_date_str}&days={days}&dep_country={dep_country}&dep_city={dep_city}&dest_region={dest_region}&a_1=2&hotel_id={hotel_info['id']}"
-    
-    return meal, rating, link
+def parse_ajax_meal(content):
+    """Parse and filter strictly for All Inclusive and Ultra All Inclusive"""
+    content_lower = content.lower()
+    if "ultra all inclusive" in content_lower or "ultra all-inclusive" in content_lower:
+        return "Ultra All Inclusive"
+    if "all inclusive" in content_lower or "all-inclusive" in content_lower:
+        return "All Inclusive"
+    return None
 
 
 def fetch_hotel_price(session, hotel_info, departure_date, max_price=None):
-    """Fetch price for a single hotel on a specific date via Travos AJAX"""
+    """
+    Fetch price for a single hotel on a specific date via Travos AJAX.
+    Strictly: Charter flight from Iasi (dep_city = 193) & All Inclusive only.
+    """
     date_str = departure_date.strftime("%d/%m/%Y")
-    dep_city = int(SEARCH_PARAMS.get("dep_city", 193))
-    dest_region = int(SEARCH_PARAMS.get("dest_region", 124))
-    dep_country = int(SEARCH_PARAMS.get("dep_country", 113))
+    dep_city = int(SEARCH_PARAMS.get("dep_city", 193))  # 193 = Iasi
+    dest_region = int(SEARCH_PARAMS.get("dest_region", 124))  # 124 = Antalya
+    dep_country = int(SEARCH_PARAMS.get("dep_country", 113))  # 113 = Romania
     days = int(SEARCH_PARAMS.get("days", 7))
     a_1 = int(SEARCH_PARAMS.get("a_1", 2))
     hotel_id = int(hotel_info["id"])
     
+    # PHP serialized format for Travos search.php AJAX endpoint (force_ts=1 pentru charter)
     php_ser = f'a:9:{{s:4:"from";s:10:"{date_str}";s:4:"days";i:{days};s:8:"force_ts";i:1;s:11:"dep_country";i:{dep_country};s:8:"dep_city";i:{dep_city};s:11:"dest_region";i:{dest_region};s:3:"a_1";i:{a_1};s:8:"hotel_id";i:{hotel_id};s:13:"hotelCityName";N;}}'
     b64_params = base64.b64encode(php_ser.encode("utf-8")).decode("utf-8")
     
@@ -231,21 +206,32 @@ def fetch_hotel_price(session, hotel_info, departure_date, max_price=None):
         if max_price is not None and max_price > 0 and price > max_price:
             return None
         
-        meal, rating, url = parse_ajax_offer(content, hotel_info, date_str)
+        # Filtru strict: Doar All Inclusive si Ultra All Inclusive
+        meal = parse_ajax_meal(content)
+        if not meal:
+            return None
+        
+        # Rating / Stele
+        rating = ""
+        r_match = RATING_RE.search(content)
+        if r_match:
+            stars = r_match.group(1) or r_match.group(2) or r_match.group(3)
+            if stars:
+                rating = f"{stars} stele" if "stele" not in stars.lower() else stars
         
         return {
             "hotel": hotel_info["name"],
             "price_eur": price,
             "meal": meal,
             "rating": rating,
-            "url": url,
+            "url": "",  # Fara link conform solicitarii
         }
     except Exception:
         return None
 
 
 def fetch_page(session, departure_date, page):
-    """Fetch search results page (HTML fallback)"""
+    """Fetch search results page (HTML fallback compatibility)"""
     params = dict(SEARCH_PARAMS)
     params["from"] = departure_date.strftime("%d/%m/%Y")
     params["page"] = page
@@ -282,7 +268,7 @@ def parse_hotels(html, page_url):
             text = container.get_text(" ", strip=True)
             if "€" in text:
                 best_text = text
-                if any(m.lower() in text.lower() for m in MEALS):
+                if any(m.lower() in text.lower() for m in ALLOWED_MEALS):
                     break
 
         if "€" not in best_text:
@@ -296,10 +282,12 @@ def parse_hotels(html, page_url):
             continue
 
         meal = ""
-        for m in MEALS:
+        for m in ALLOWED_MEALS:
             if m.lower() in best_text.lower():
                 meal = m
                 break
+        if not meal:
+            continue
 
         rating_match = RATING_RE.search(best_text)
         rating = rating_match.group(1) or rating_match.group(2) if rating_match else ""
@@ -310,7 +298,7 @@ def parse_hotels(html, page_url):
             "price_eur": price,
             "meal": meal,
             "rating": rating,
-            "url": href,
+            "url": "",
         }
 
     return list(results.values())
@@ -347,7 +335,7 @@ def save_and_report(conn, departure_date, hotels):
             h["price_eur"],
             h["meal"],
             h["rating"],
-            h["url"],
+            h.get("url", ""),
         ))
 
         if old_price is not None:
@@ -359,45 +347,73 @@ def save_and_report(conn, departure_date, hotels):
     return changes
 
 
-def scrape_date(session, departure_date, hotels_catalog=None, max_price=None):
-    """Scrape all available hotel offers for a departure date"""
+def scrape_date(session, departure_date, hotels_catalog=None, max_price=None, max_workers=MAX_WORKERS):
+    """Scrape all available hotel offers for a departure date using concurrent threads"""
     if hotels_catalog is None:
         hotels_catalog = get_hotel_catalog(session)
     
     excluded = load_excluded()
+    catalog_filtered = [
+        h for h in hotels_catalog.values()
+        if normalize_name(h["name"]) not in excluded
+    ]
+    
     found_hotels = []
+
+    def fetch_task(h_info):
+        return fetch_hotel_price(session, h_info, departure_date, max_price=max_price)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(fetch_task, catalog_filtered)
+        for res in results:
+            if res:
+                found_hotels.append(res)
     
-    for h_id, h_info in hotels_catalog.items():
-        if normalize_name(h_info["name"]) in excluded:
-            continue
-        
-        offer = fetch_hotel_price(session, h_info, departure_date, max_price=max_price)
-        if offer:
-            found_hotels.append(offer)
-        
-        time.sleep(REQUEST_DELAY_SECONDS)
-    
+    # Sortare dupa pret crescator
+    found_hotels.sort(key=lambda x: x["price_eur"])
     return found_hotels
+
+
+def create_configured_session():
+    """Create a requests session with connection pooling for high-performance requests"""
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=25,
+        pool_maxsize=25,
+        max_retries=2
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    # Warm up session with initial page to receive cookies
+    try:
+        session.get("https://www.travos.ro/", headers=HEADERS, timeout=10)
+    except Exception:
+        pass
+    return session
 
 
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Travos Hotel Price Monitor")
+    parser = argparse.ArgumentParser(description="Travos Hotel Price Monitor (Charter Iasi -> Antalya)")
     parser.add_argument("--date", default=BASE_DATE, help="Data centrala (ZZ/LL/AAAA)")
     parser.add_argument("--days-before", type=int, default=DAYS_BEFORE, help="Zile inainte de data centrala")
     parser.add_argument("--days-after", type=int, default=DAYS_AFTER, help="Zile dupa data centrala")
     parser.add_argument("--max-price", type=float, default=MAX_PRICE, help="Pret maxim EUR")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="Numar thread-uri paralele")
     args = parser.parse_args()
 
     base_date = args.date
     days_before = args.days_before
     days_after = args.days_after
     max_price = args.max_price
+    max_workers = args.workers
 
     print("=" * 70)
-    print("TRAVOS HOTEL MONITOR")
+    print("TRAVOS HOTEL MONITOR (CHARTER IASI -> ANTALYA)")
     print(f"Data centrala: {base_date}")
     print(f"Interval: -{days_before} / +{days_after} zile")
+    print("Regim masa: DOAR All Inclusive & Ultra All Inclusive")
+    print("Zbor: DOAR Charter din Iasi")
     if max_price:
         print(f"Filtru pret maxim: {max_price:.0f} EUR")
     print("=" * 70)
@@ -405,31 +421,36 @@ def main():
     conn = sqlite3.connect(DATABASE_FILE)
     init_db(conn)
 
-    session = requests.Session()
+    session = create_configured_session()
     print("\nIncarc catalogul de hoteluri din regiunea Antalya...")
+    t_cat = time.time()
     hotels_catalog = get_hotel_catalog(session)
-    print(f"Catalog incarcat: {len(hotels_catalog)} hoteluri gasite.")
+    print(f"Catalog incarcat in {time.time() - t_cat:.1f}s: {len(hotels_catalog)} hoteluri.")
 
     total_hotels = 0
     all_changes = []
 
     for departure_date in date_range(base_date, days_before, days_after):
         date_str = departure_date.strftime('%d/%m/%Y')
-        print(f"\nVerific data de plecare: {date_str}...")
+        print(f"\nVerific plecare din Iasi: {date_str}...")
+        t_start = time.time()
 
         try:
-            hotels = scrape_date(session, departure_date, hotels_catalog, max_price=max_price)
+            hotels = scrape_date(session, departure_date, hotels_catalog, max_price=max_price, max_workers=max_workers)
         except Exception as e:
             print(f"EROARE la cautare: {e}")
             continue
 
-        print(f"  -> Hoteluri cu oferte active: {len(hotels)}")
+        elapsed = time.time() - t_start
+        print(f"  -> {len(hotels)} oferte All Inclusive gasite ({elapsed:.1f} secunde)")
         total_hotels += len(hotels)
 
-        for h in hotels[:5]:
-            print(f"     • {h['hotel']}: {h['price_eur']:.0f}€ ({h['meal']})")
-        if len(hotels) > 5:
-            print(f"     ... si inca {len(hotels) - 5} oferte.")
+        # Afisam primele cele mai bune oferte (fara link)
+        for h in hotels[:8]:
+            stars_str = f" | {h['rating']}" if h['rating'] else ""
+            print(f"     • {h['hotel']}: {h['price_eur']:.0f}€ | {h['meal']}{stars_str}")
+        if len(hotels) > 8:
+            print(f"     ... si inca {len(hotels) - 8} hoteluri in baza de date.")
 
         changes = save_and_report(conn, departure_date, hotels)
         for hotel, old, new, diff in changes:
@@ -442,11 +463,11 @@ def main():
 
     print("\n" + "=" * 70)
     print(f"TOTAL OFERTE EXTRASE: {total_hotels}")
-    print(f"MODIFICARI DETECTATE: {len(all_changes)}")
+    print(f"MODIFICARI DE PRET DETECTATE: {len(all_changes)}")
     print("=" * 70)
 
     if not all_changes:
-        print("Prima rulare sau nu au fost detectate modificari fata de verificarile anterioare.")
+        print("Prima rulare sau nu au fost detectate modificari de pret.")
 
 
 if __name__ == "__main__":
