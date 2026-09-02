@@ -31,3 +31,11 @@ jobs:
     
     - name: Run monitor
       run: python main.py
+
+    - name: Upload Database Artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: travos-prices-db
+        path: prices.db
+
