@@ -1,0 +1,5 @@
+# Un hotel pe fiecare rand.
+# Liniile care incep cu # sunt ignorate.
+# Exemplu:
+# Hotel Belpoint Beach
+# Hotel Ares Dream
